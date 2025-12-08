@@ -26,10 +26,28 @@ async function run() {
     try {
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
 
+         const db = client.db('StyleDecorDB');
+        const usersCollection = db.collection('users');
+
         // Basic Route
         app.get('/', (req, res) => {
             res.send('StyleDecor Server is running');
         });
+
+        // User Related Api
+          app.post('/users', async (req, res) => {
+            const user = req.body;
+            user.role = 'user';
+            user.createdAt = new Date();
+
+            const email = user.email
+            const userExist = await usersCollection.findOne({ email })
+            if (userExist) {
+                return res.send({ message: 'user already exist' })
+            }
+            const result = await usersCollection.insertOne(user);
+            res.json(result); // json => send
+        })
 
 
 
