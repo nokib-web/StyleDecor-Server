@@ -355,6 +355,9 @@ async function run() {
     app.get('/bookings', verifyJWT, async (req, res) => {
       const role = req.decoded_role;
       const email = req.decoded_email;
+      const page = parseInt(req.query.page) || 0;
+      const limit = parseInt(req.query.limit) || 10;
+      const skip = page * limit;
 
       let query = {};
       if (role === 'user') {
@@ -362,9 +365,37 @@ async function run() {
       } else if (role === 'decorator') {
         query = { decoratorEmail: email };
       }
-      // admin sees all by default if no filtering applied
 
-      const result = await bookingsCollection.find(query).toArray();
+      const result = await bookingsCollection.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray();
+
+      const total = await bookingsCollection.countDocuments(query);
+
+      res.send({
+        data: result,
+        total,
+        limit,
+        page
+      });
+    });
+
+    // Cancel Booking (User - only 'pending')
+    app.delete('/bookings/:id', verifyJWT, async (req, res) => {
+      const id = req.params.id;
+      const email = req.decoded_email;
+      const role = req.decoded_role;
+
+      const query = { _id: new ObjectId(id) };
+
+      if (role === 'user') {
+        query.userEmail = email;
+        query.status = 'pending';
+      }
+
+      const result = await bookingsCollection.deleteOne(query);
       res.send(result);
     });
 
