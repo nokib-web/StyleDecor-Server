@@ -93,7 +93,9 @@ async function run() {
         const usersCollection = db.collection('users');
         const servicesCollection = db.collection('services');
         const bookingsCollection = db.collection('bookings');
+
         const paymentsCollection = db.collection('payments');
+        const applicationsCollection = db.collection('applications');
 
         app.get('/', (req, res) => res.send('StyleDecor Server is running'));
 
@@ -242,6 +244,9 @@ async function run() {
         app.get('/services', async (req, res) => {
             try {
                 const { search, sort, category } = req.query;
+                const page = parseInt(req.query.page) || 0;
+                const limit = parseInt(req.query.limit) || 12; // default 12 as requested
+                const skip = page * limit;
 
                 let query = {};
 
@@ -255,6 +260,18 @@ async function run() {
                     query.category = category;
                 }
 
+                // Price Range Filter
+                const { min, max } = req.query;
+                if (min || max) {
+                    query.price = {};
+                    if (min) query.price.$gte = parseFloat(min);
+                    if (max) query.price.$lte = parseFloat(max);
+                }
+
+
+                // Get total count for pagination
+                const total = await servicesCollection.countDocuments(query);
+
                 let cursor = servicesCollection.find(query);
 
                 // Sorting
@@ -266,14 +283,46 @@ async function run() {
                     cursor = cursor.sort({ createdAt: -1 });
                 }
 
-                const allServices = await cursor.toArray();
+                const result = await cursor.skip(skip).limit(limit).toArray();
 
                 res.send({
                     success: true,
-                    count: allServices.length,
-                    data: allServices
+                    count: result.length,
+                    total,   // Total matching documents
+                    page,
+                    limit,
+                    data: result
                 });
 
+            } catch (error) {
+                res.status(500).send({ message: 'Server error', error });
+            }
+        });
+
+
+        // Get all unique categories with counts
+        app.get('/services/categories', async (req, res) => {
+            try {
+                const categories = await servicesCollection.aggregate([
+                    {
+                        $group: {
+                            _id: "$category",
+                            count: { $sum: 1 }
+                        }
+                    },
+                    {
+                        $project: {
+                            category: "$_id",
+                            count: 1,
+                            _id: 0
+                        }
+                    },
+                    {
+                        $sort: { category: 1 }
+                    }
+                ]).toArray();
+
+                res.send(categories);
             } catch (error) {
                 res.status(500).send({ message: 'Server error', error });
             }
@@ -603,6 +652,81 @@ async function run() {
             const query = { email: req.params.email };
             const result = await paymentsCollection.find(query).toArray();
             res.send(result);
+        });
+
+        // ---------------------------------------------------------
+        // DECORATOR FEATURES
+        // ---------------------------------------------------------
+
+        // Submit Application
+        app.post('/applications', async (req, res) => {
+            try {
+                const application = req.body;
+                application.createdAt = new Date();
+                application.status = 'pending';
+                // Check if already applied
+                const existing = await applicationsCollection.findOne({ email: application.email });
+                if (existing) {
+                    return res.send({ message: 'Already applied', insertedId: null });
+                }
+                const result = await applicationsCollection.insertOne(application);
+                res.send(result);
+            } catch (error) {
+                console.error("Error submitting application:", error);
+                res.status(500).send({ message: 'Server error' });
+            }
+        });
+
+        // Get Decorator Stats
+        app.get('/decorator/stats', verifyJWT, async (req, res) => {
+            const email = req.decoded_email;
+            const role = req.decoded_role;
+
+            if (role !== 'decorator') {
+                return res.status(403).send({ message: 'Forbidden access' });
+            }
+
+            try {
+                // Aggregate bookings for this decorator
+                // We only count 'paid' or 'competed' bookings for earnings typically,
+                // but let's assume 'paid' is the trigger for now.
+                // Assuming services have a fixed price in the booking or we fetch from service?
+                // The booking schema should have 'price'.
+                // If not, we might need to lookup. But let's assume booking has it or we just count count for now.
+
+                // Let's check how bookings are stored. In /bookings POST, allow user to send price? 
+                // Or we rely on the service details. 
+                // For simplified 'earnings', let's sum 'price' of bookings where status='paid' or 'completed'.
+
+                const stats = await bookingsCollection.aggregate([
+                    {
+                        $match: {
+                            decoratorEmail: email,
+                            status: { $in: ['paid', 'completed', 'in-progress'] } // active/paid bookings
+                        }
+                    },
+                    {
+                        $group: {
+                            _id: null,
+                            totalBookings: { $sum: 1 },
+                            totalEarnings: { $sum: { $toDouble: "$price" } }, // Ensure price is number
+                            completedBookings: {
+                                $sum: {
+                                    $cond: [{ $eq: ["$status", "completed"] }, 1, 0]
+                                }
+                            }
+                        }
+                    }
+                ]).toArray();
+
+                const data = stats.length > 0 ? stats[0] : { totalBookings: 0, totalEarnings: 0, completedBookings: 0 };
+
+                res.send(data);
+
+            } catch (error) {
+                console.error("Error getting decorator stats:", error);
+                res.status(500).send({ message: 'Server error' });
+            }
         });
 
         // ---------------------------------------------------------
