@@ -367,14 +367,51 @@ async function run() {
             res.send(result);
         });
 
-        // Update user role (Admin)
+        // Update user role and status (Admin)
         app.patch('/users/role/:id', verifyJWT, verifyAdmin, async (req, res) => {
             const id = req.params.id;
-            const { role } = req.body;
+            const { role, status } = req.body;
             const filter = { _id: new ObjectId(id) };
+
+            const updateFields = {};
+            if (role) updateFields.role = role;
+            if (status) updateFields.status = status;
+
             const updateDoc = {
-                $set: { role: role }
+                $set: updateFields
             };
+            const result = await usersCollection.updateOne(filter, updateDoc);
+            res.send(result);
+        });
+
+        // ---------------------------------------------------------
+        // APPLICATIONS (Become Decorator)
+        // ---------------------------------------------------------
+
+        app.post('/applications', verifyJWT, async (req, res) => {
+            const application = req.body;
+
+            // Check if already applied
+            const existingApplication = await usersCollection.findOne({ email: application.email, status: 'requested' });
+            if (existingApplication) {
+                return res.send({ message: 'Already applied' });
+            }
+
+            // Ideally we might want a separate applicationsCollection, but for simplicity given the request,
+            // we will just update the user's status to 'requested' and maybe store extra details if needed.
+            // But 'ManageDecorators' looks at 'users'. So let's update 'users' collection directly.
+
+            const filter = { email: application.email };
+            const updateDoc = {
+                $set: {
+                    status: 'requested',
+                    specialty: application.specialty,
+                    experience: application.experience,
+                    portfolio: application.portfolio,
+                    description: application.description
+                }
+            };
+
             const result = await usersCollection.updateOne(filter, updateDoc);
             res.send(result);
         });
