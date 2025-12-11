@@ -96,8 +96,133 @@ async function run() {
 
         const paymentsCollection = db.collection('payments');
         const applicationsCollection = db.collection('applications');
+        const wishlistCollection = db.collection('wishlist');
+        const reviewsCollection = db.collection('reviews');
+        const messagesCollection = db.collection('messages'); // New Chat Collection
+        const portfoliosCollection = db.collection('portfolios');
 
         app.get('/', (req, res) => res.send('StyleDecor Server is running'));
+
+        // ===========================================
+        // WISHLIST ENDPOINTS
+        // ===========================================
+        // ... (existing wishlist code) ...
+        // Add to Wishlist
+        app.post('/wishlist', verifyJWT, async (req, res) => {
+            const item = req.body;
+            // Check duplicate
+            const exists = await wishlistCollection.findOne({
+                userEmail: item.userEmail,
+                serviceId: item.serviceId
+            });
+            if (exists) {
+                return res.send({ message: 'Already in wishlist', insertedId: null });
+            }
+            const result = await wishlistCollection.insertOne(item);
+            res.send(result);
+        });
+
+        // Get User Wishlist
+        app.get('/wishlist', verifyJWT, async (req, res) => {
+            const email = req.decoded_email;
+            const result = await wishlistCollection.find({ userEmail: email }).toArray();
+            res.send(result);
+        });
+
+        // Remove from Wishlist
+        app.delete('/wishlist/:id', verifyJWT, async (req, res) => {
+            const id = req.params.id;
+            const result = await wishlistCollection.deleteOne({ _id: new ObjectId(id) });
+            res.send(result);
+        });
+
+        // ===========================================
+        // REVIEWS ENDPOINTS
+        // ===========================================
+        // Add Review
+        app.post('/reviews', verifyJWT, async (req, res) => {
+            const review = req.body;
+            review.createdAt = new Date();
+            const result = await reviewsCollection.insertOne(review);
+            res.send(result);
+        });
+
+        // Get Reviews for a Service
+        app.get('/reviews/:serviceId', async (req, res) => {
+            const serviceId = req.params.serviceId;
+            const result = await reviewsCollection.find({ serviceId: serviceId }).sort({ createdAt: -1 }).toArray();
+            res.send(result);
+        });
+
+        // ===========================================
+        // CHAT / MESSAGING ENDPOINTS
+        // ===========================================
+        // Send a Message
+        // Send a Message
+        app.post('/messages', verifyJWT, async (req, res) => {
+            const message = req.body;
+            message.createdAt = new Date();
+            message.read = false; // Set initial read status
+            const result = await messagesCollection.insertOne(message);
+            res.send(result);
+        });
+
+        // Get Messages for a Booking
+        app.get('/messages/:bookingId', verifyJWT, async (req, res) => {
+            const bookingId = req.params.bookingId;
+            const result = await messagesCollection.find({ bookingId: bookingId }).sort({ createdAt: 1 }).toArray();
+            res.send(result);
+        });
+
+        // Mark Messages as Read
+        app.patch('/messages/mark-read/:bookingId', verifyJWT, async (req, res) => {
+            const bookingId = req.params.bookingId;
+            const userEmail = req.decoded_email;
+
+            // Mark all messages in this booking NOT sent by me as read
+            const filter = {
+                bookingId: bookingId,
+                senderEmail: { $ne: userEmail },
+                read: false
+            };
+
+            const updateDoc = {
+                $set: { read: true }
+            };
+
+            const result = await messagesCollection.updateMany(filter, updateDoc);
+            res.send(result);
+        });
+
+        // ===========================================
+        // PORTFOLIO ENDPOINTS
+        // ===========================================
+        // Create Portfolio Item
+        app.post('/portfolios', verifyJWT, async (req, res) => {
+            const item = req.body;
+            item.createdAt = new Date();
+            // Ensure decorator email is attached securely
+            item.decoratorEmail = req.decoded_email;
+
+            const result = await portfoliosCollection.insertOne(item);
+            res.send(result);
+        });
+
+        // Get All Portfolios (Public)
+        app.get('/portfolios', async (req, res) => {
+            const result = await portfoliosCollection.find().sort({ createdAt: -1 }).toArray();
+            res.send(result);
+        });
+
+        // Get My Portfolio (Decorator)
+        app.get('/portfolios/my-portfolio', verifyJWT, async (req, res) => {
+            const email = req.decoded_email;
+            const result = await portfoliosCollection.find({ decoratorEmail: email }).sort({ createdAt: -1 }).toArray();
+            res.send(result);
+        });
+
+
+
 
         // Firebase login: client posts idToken; server verifies and issues cookies
         app.post('/auth/firebase-login', async (req, res) => {
@@ -211,8 +336,20 @@ async function run() {
         app.get('/users/me', verifyJWT, async (req, res) => {
             try {
                 const email = req.decoded_email;
-                const user = await usersCollection.findOne({ email }, { projection: { refreshToken: 0 } });
+                let user = await usersCollection.findOne({ email }, { projection: { refreshToken: 0 } });
                 if (!user) return res.status(404).send({ message: 'User not found' });
+
+                // Backward compatibility: Generate referral code if missing
+                if (!user.referralCode) {
+                    const newCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+                    await usersCollection.updateOne(
+                        { email: user.email },
+                        { $set: { referralCode: newCode, referralRewards: [] } }
+                    );
+                    user.referralCode = newCode;
+                    user.referralRewards = [];
+                }
+
                 return res.json({ user });
             } catch (err) {
                 console.error(err);
@@ -226,13 +363,45 @@ async function run() {
         });
 
         // (Optional) legacy users creation route (kept for compatibility)
+        // (Optional) legacy users creation route (kept for compatibility)
         app.post('/users', async (req, res) => {
             const user = req.body;
             user.role = user.role || 'user';
             user.createdAt = new Date();
 
+            // Generate unique referral code for the new user
+            user.referralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+            user.referralRewards = []; // Init rewards array
+
             const existing = await usersCollection.findOne({ email: user.email });
             if (existing) return res.send({ message: 'user already exist' });
+
+            // Application of Referral Logic
+            if (user.referralCodeInput) {
+                const referrer = await usersCollection.findOne({ referralCode: user.referralCodeInput });
+                if (referrer) {
+                    user.referredBy = referrer.email;
+
+                    // Reward Referrer (10% OFF Coupon)
+                    const reward = {
+                        id: new ObjectId(),
+                        type: 'coupon',
+                        code: `REF-${Math.floor(1000 + Math.random() * 9000)}`,
+                        discount: 10,
+                        description: 'Referral Bonus: 10% OFF',
+                        createdAt: new Date(),
+                        isUsed: false
+                    };
+
+                    await usersCollection.updateOne(
+                        { email: referrer.email },
+                        { $push: { referralRewards: reward } }
+                    );
+                }
+            }
+
+            // Remove the input field from the saved object
+            delete user.referralCodeInput;
 
             const result = await usersCollection.insertOne(user);
             res.json(result);
@@ -478,19 +647,26 @@ async function run() {
             }
 
             console.log(`API: Get Bookings - Role: ${role}, Email: ${email}`);
-            console.log("API: Query:", query);
 
-            const result = await bookingsCollection.find(query)
+            let result = await bookingsCollection.find(query)
                 .sort({ createdAt: -1 })
                 .skip(skip)
                 .limit(limit)
                 .toArray();
 
-            console.log("API: Bookings Found:", result.length);
-            console.log("API: First Booking (if any):", result[0]);
+            // Calculate Unread Messages for each booking
+            if (role === 'user' || role === 'decorator') {
+                for (const booking of result) {
+                    const unreadCount = await messagesCollection.countDocuments({
+                        bookingId: booking._id.toString(),
+                        senderEmail: { $ne: email },
+                        read: false
+                    });
+                    booking.unreadCount = unreadCount;
+                }
+            }
 
             const total = await bookingsCollection.countDocuments(query);
-            console.log("API: Total Bookings count:", total);
 
             res.send({
                 data: result,
