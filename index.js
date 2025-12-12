@@ -79,10 +79,16 @@ const generateRefreshToken = (payload) => {
     return jwt.sign(payload, process.env.JWT_REFRESH_SECRET, { expiresIn: process.env.JWT_REFRESH_EXPIRES || '7d' });
 };
 
-// JWT verification middleware (cookie)
+// JWT verification middleware (Header: Authorization: Bearer <token>)
 const verifyJWT = (req, res, next) => {
-    const token = req.cookies?.accessToken;
-    if (!token) return res.status(401).send({ message: 'Unauthorized access' });
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        return res.status(401).send({ message: 'Unauthorized access' });
+    }
+    const token = authHeader.split(' ')[1];
+    if (!token) {
+        return res.status(401).send({ message: 'Unauthorized access' });
+    }
 
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) return res.status(403).send({ message: 'Invalid access token' });
@@ -247,7 +253,8 @@ async function run() {
 
 
 
-        // Firebase login: client posts idToken; server verifies and issues cookies
+        // Firebase login: client posts idToken; server verifies
+        // RESPONSE: Returns accessToken and refreshToken in JSON (No Cookies)
         app.post('/auth/firebase-login', async (req, res) => {
             try {
                 const { idToken } = req.body;
@@ -283,19 +290,13 @@ async function run() {
                 // store refresh token in DB (for revocation)
                 await usersCollection.updateOne({ email }, { $set: { refreshToken } });
 
-                // PRODUCTION: Force Secure + SameSite=None
-                // DEVELOPMENT: Secure=false, SameSite=Lax (for localhost)
-                const isProd = process.env.NODE_ENV === 'production';
-                const cookieOptions = {
-                    httpOnly: true,
-                    secure: isProd,
-                    sameSite: isProd ? 'none' : 'lax',
-                };
-
-                res.cookie('accessToken', accessToken, { ...cookieOptions, maxAge: 15 * 60 * 1000 });
-                res.cookie('refreshToken', refreshToken, { ...cookieOptions, maxAge: 7 * 24 * 60 * 60 * 1000 });
-
-                return res.json({ message: 'Login successful', role: user.role });
+                // Respond with tokens in JSON
+                return res.json({
+                    message: 'Login successful',
+                    role: user.role,
+                    accessToken,
+                    refreshToken
+                });
             } catch (err) {
                 console.error('firebase-login error:', err);
                 return res.status(401).send({ message: 'Invalid Firebase token' });
@@ -303,10 +304,12 @@ async function run() {
         });
 
         // Refresh endpoint
+        // REQUEST: { refreshToken: "..." }
+        // RESPONSE: { accessToken: "..." }
         app.post('/auth/refresh-token', async (req, res) => {
             try {
-                const refreshToken = req.cookies?.refreshToken;
-                if (!refreshToken) return res.status(401).send({ message: 'No refresh token' });
+                const { refreshToken } = req.body;
+                if (!refreshToken) return res.status(401).send({ message: 'No refresh token provided' });
 
                 const user = await usersCollection.findOne({ refreshToken });
                 if (!user) return res.status(403).send({ message: 'Invalid refresh token' });
@@ -315,16 +318,8 @@ async function run() {
                     if (err) return res.status(403).send({ message: 'Invalid refresh token' });
 
                     const newAccessToken = generateAccessToken({ email: decoded.email, role: user.role });
-                    const isProd = process.env.NODE_ENV === 'production';
 
-                    res.cookie('accessToken', newAccessToken, {
-                        httpOnly: true,
-                        secure: isProd,
-                        sameSite: isProd ? 'none' : 'lax',
-                        maxAge: 15 * 60 * 1000,
-                    });
-
-                    return res.json({ message: 'Access token refreshed' });
+                    return res.json({ message: 'Access token refreshed', accessToken: newAccessToken });
                 });
             } catch (err) {
                 console.error('refresh-token error:', err);
@@ -335,21 +330,10 @@ async function run() {
         // Logout
         app.post('/auth/logout', async (req, res) => {
             try {
-                const refreshToken = req.cookies?.refreshToken;
-                if (refreshToken) {
-                    await usersCollection.updateOne({ refreshToken }, { $unset: { refreshToken: "" } });
-                }
-
-                const isProd = process.env.NODE_ENV === 'production';
-                const cookieOptions = {
-                    httpOnly: true,
-                    secure: isProd,
-                    sameSite: isProd ? 'none' : 'lax',
-                };
-
-                res.clearCookie('accessToken', cookieOptions);
-                res.clearCookie('refreshToken', cookieOptions);
-
+                // Ideally client sends ID, but we can't easily get it if not authenticated.
+                // Or client just clears local storage.
+                // We can optionally invalidate if client sends it.
+                // For now, simpler: Just success. Client clears token.
                 return res.json({ message: 'Logged out' });
             } catch (err) {
                 console.error('logout error:', err);
@@ -575,6 +559,14 @@ async function run() {
                 $set: updateFields
             };
             const result = await usersCollection.updateOne(filter, updateDoc);
+            res.send(result);
+        });
+
+        // Delete user (Admin)
+        app.delete('/users/:id', verifyJWT, verifyAdmin, async (req, res) => {
+            const id = req.params.id;
+            const query = { _id: new ObjectId(id) };
+            const result = await usersCollection.deleteOne(query);
             res.send(result);
         });
 
