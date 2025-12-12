@@ -1,10 +1,9 @@
+// index.js (final, production-safe cookie handling + delete-user endpoint)
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const admin = require("firebase-admin");
-// const serviceAccount = require("./styledecor-Admin-SDK.json"); // Removed direct require for safety fallback
-
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET;
@@ -13,9 +12,8 @@ else console.log("Stripe Key Loaded: " + stripeKey + "...");
 const stripe = require('stripe')(stripeKey);
 
 const app = express();
-// const cors = require('cors');
+app.set('trust proxy', 1); // Trust first proxy (Render/Vercel)
 const port = process.env.PORT || 5000;
-
 
 // Initialize Firebase Admin
 let serviceAccount;
@@ -41,7 +39,6 @@ if (serviceAccount) {
     console.error("Firebase Admin SDK not initialized. Missing credentials.");
 }
 
-
 const allowedOrigins = [
     process.env.CLIENT_URL,
     'https://style-decor-client-two.vercel.app',
@@ -52,8 +49,6 @@ const allowedOrigins = [
 // Middleware
 app.use(cors({
     origin: (origin, callback) => {
-        // The allowedOrigins array is now accessible here (Closure/Scope)
-
         // Allow requests without origin (mobile apps, curl, Postman)
         if (!origin) return callback(null, true);
 
@@ -69,6 +64,34 @@ app.use(cors({
 
 app.use(express.json());
 app.use(cookieParser());
+
+// ------------------------
+// Cookie helper (production-safe)
+// ------------------------
+
+function buildCookieOptions(req) {
+    const originHeader = (req.headers.origin || "").toString();
+    // Treat empty origin (curl/Postman/server-to-server) as local-like to avoid blocking
+    const isLocalOrigin =
+        originHeader === "" ||
+        originHeader.includes('localhost') ||
+        originHeader.includes('127.0.0.1');
+
+    const cookieDomain = process.env.COOKIE_DOMAIN || undefined; // e.g. ".yourdomain.com"
+    const base = {
+        httpOnly: true,
+        secure: !isLocalOrigin,
+        sameSite: isLocalOrigin ? 'lax' : 'none',
+        path: '/',
+    };
+
+    if (cookieDomain) base.domain = cookieDomain;
+
+    // Helpful debugging (remove or lower log level in production)
+    console.debug('[Cookie Options]', { origin: originHeader, isLocalOrigin, domain: cookieDomain, secure: base.secure, sameSite: base.sameSite });
+
+    return base;
+}
 
 // JWT helpers
 const generateAccessToken = (payload) => {
@@ -110,58 +133,45 @@ async function run() {
     try {
         await client.connect();
 
-        // All The collection
+        // Collections
         const db = client.db('StyleDecorDB');
         const usersCollection = db.collection('users');
         const servicesCollection = db.collection('services');
         const bookingsCollection = db.collection('bookings');
-
         const paymentsCollection = db.collection('payments');
         const applicationsCollection = db.collection('applications');
         const wishlistCollection = db.collection('wishlist');
         const reviewsCollection = db.collection('reviews');
-        const messagesCollection = db.collection('messages'); // New Chat Collection
+        const messagesCollection = db.collection('messages');
         const portfoliosCollection = db.collection('portfolios');
 
         app.get('/', (req, res) => res.send('StyleDecor Server is running'));
 
-        // ===========================================
-        // WISHLIST ENDPOINTS
-        // ===========================================
-        // ... (existing wishlist code) ...
-        // Add to Wishlist
+        // ================= WISHLIST =================
         app.post('/wishlist', verifyJWT, async (req, res) => {
             const item = req.body;
-            // Check duplicate
             const exists = await wishlistCollection.findOne({
                 userEmail: item.userEmail,
                 serviceId: item.serviceId
             });
-            if (exists) {
-                return res.send({ message: 'Already in wishlist', insertedId: null });
-            }
+            if (exists) return res.send({ message: 'Already in wishlist', insertedId: null });
             const result = await wishlistCollection.insertOne(item);
             res.send(result);
         });
 
-        // Get User Wishlist
         app.get('/wishlist', verifyJWT, async (req, res) => {
             const email = req.decoded_email;
             const result = await wishlistCollection.find({ userEmail: email }).toArray();
             res.send(result);
         });
 
-        // Remove from Wishlist
         app.delete('/wishlist/:id', verifyJWT, async (req, res) => {
             const id = req.params.id;
             const result = await wishlistCollection.deleteOne({ _id: new ObjectId(id) });
             res.send(result);
         });
 
-        // ===========================================
-        // REVIEWS ENDPOINTS
-        // ===========================================
-        // Add Review
+        // ================= REVIEWS =================
         app.post('/reviews', verifyJWT, async (req, res) => {
             const review = req.body;
             review.createdAt = new Date();
@@ -169,83 +179,61 @@ async function run() {
             res.send(result);
         });
 
-        // Get Reviews for a Service
         app.get('/reviews/:serviceId', async (req, res) => {
             const serviceId = req.params.serviceId;
-            const result = await reviewsCollection.find({ serviceId: serviceId }).sort({ createdAt: -1 }).toArray();
+            const result = await reviewsCollection.find({ serviceId }).sort({ createdAt: -1 }).toArray();
             res.send(result);
         });
 
-        // ===========================================
-        // CHAT / MESSAGING ENDPOINTS
-        // ===========================================
-        // Send a Message
-        // Send a Message
+        // ================= MESSAGING =================
         app.post('/messages', verifyJWT, async (req, res) => {
             const message = req.body;
             message.createdAt = new Date();
-            message.read = false; // Set initial read status
+            message.read = false;
             const result = await messagesCollection.insertOne(message);
             res.send(result);
         });
 
-        // Get Messages for a Booking
         app.get('/messages/:bookingId', verifyJWT, async (req, res) => {
             const bookingId = req.params.bookingId;
-            const result = await messagesCollection.find({ bookingId: bookingId }).sort({ createdAt: 1 }).toArray();
+            const result = await messagesCollection.find({ bookingId }).sort({ createdAt: 1 }).toArray();
             res.send(result);
         });
 
-        // Mark Messages as Read
         app.patch('/messages/mark-read/:bookingId', verifyJWT, async (req, res) => {
             const bookingId = req.params.bookingId;
             const userEmail = req.decoded_email;
-
-            // Mark all messages in this booking NOT sent by me as read
             const filter = {
-                bookingId: bookingId,
+                bookingId,
                 senderEmail: { $ne: userEmail },
                 read: false
             };
-
-            const updateDoc = {
-                $set: { read: true }
-            };
-
+            const updateDoc = { $set: { read: true } };
             const result = await messagesCollection.updateMany(filter, updateDoc);
             res.send(result);
         });
 
-        // ===========================================
-        // PORTFOLIO ENDPOINTS
-        // ===========================================
-        // Create Portfolio Item
+        // ================= PORTFOLIOS =================
         app.post('/portfolios', verifyJWT, async (req, res) => {
             const item = req.body;
             item.createdAt = new Date();
-            // Ensure decorator email is attached securely
             item.decoratorEmail = req.decoded_email;
-
             const result = await portfoliosCollection.insertOne(item);
             res.send(result);
         });
 
-        // Get All Portfolios (Public)
         app.get('/portfolios', async (req, res) => {
             const result = await portfoliosCollection.find().sort({ createdAt: -1 }).toArray();
             res.send(result);
         });
 
-        // Get My Portfolio (Decorator)
         app.get('/portfolios/my-portfolio', verifyJWT, async (req, res) => {
             const email = req.decoded_email;
             const result = await portfoliosCollection.find({ decoratorEmail: email }).sort({ createdAt: -1 }).toArray();
             res.send(result);
         });
 
-
-
-
+        // ================= AUTH =================
         // Firebase login: client posts idToken; server verifies and issues cookies
         app.post('/auth/firebase-login', async (req, res) => {
             try {
@@ -279,18 +267,18 @@ async function run() {
                 const accessToken = generateAccessToken({ email, role: user.role });
                 const refreshToken = generateRefreshToken({ email });
 
-                // store refresh token in DB (for revocation)
+                // store refresh token in DB (for revocation + rotation)
                 await usersCollection.updateOne({ email }, { $set: { refreshToken } });
 
-                const isProd = process.env.NODE_ENV === 'production' || process.env.CLIENT_URL;
-                const cookieOptions = {
-                    httpOnly: true,
-                    secure: isProd,
-                    sameSite: isProd ? 'none' : 'lax',
-                };
+                // Use production-safe cookie options based on request origin
+                const baseOptions = buildCookieOptions(req);
 
-                res.cookie('accessToken', accessToken, { ...cookieOptions, maxAge: 15 * 60 * 1000 });
-                res.cookie('refreshToken', refreshToken, { ...cookieOptions, maxAge: 7 * 24 * 60 * 60 * 1000 });
+                // clear old cookies before setting new ones (avoid duplicates)
+                res.clearCookie('accessToken', baseOptions);
+                res.clearCookie('refreshToken', baseOptions);
+
+                res.cookie('accessToken', accessToken, { ...baseOptions, maxAge: 15 * 60 * 1000 });
+                res.cookie('refreshToken', refreshToken, { ...baseOptions, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
                 return res.json({ message: 'Login successful', role: user.role });
             } catch (err) {
@@ -299,27 +287,41 @@ async function run() {
             }
         });
 
-        // Refresh endpoint
+        // Refresh endpoint (rotates refresh token)
         app.post('/auth/refresh-token', async (req, res) => {
             try {
-                const refreshToken = req.cookies?.refreshToken;
-                if (!refreshToken) return res.status(401).send({ message: 'No refresh token' });
+                const oldRefreshToken = req.cookies?.refreshToken;
+                if (!oldRefreshToken) return res.status(401).send({ message: 'No refresh token' });
 
-                const user = await usersCollection.findOne({ refreshToken });
+                // Find user by stored refreshToken
+                const user = await usersCollection.findOne({ refreshToken: oldRefreshToken });
                 if (!user) return res.status(403).send({ message: 'Invalid refresh token' });
 
-                jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET, (err, decoded) => {
-                    if (err) return res.status(403).send({ message: 'Invalid refresh token' });
+                jwt.verify(oldRefreshToken, process.env.JWT_REFRESH_SECRET, async (err, decoded) => {
+                    if (err) {
+                        // invalid token, remove stored token for safety
+                        await usersCollection.updateOne({ refreshToken: oldRefreshToken }, { $unset: { refreshToken: "" } });
+                        return res.status(403).send({ message: 'Invalid refresh token' });
+                    }
 
-                    const newAccessToken = generateAccessToken({ email: decoded.email, role: user.role });
-                    const isProd = process.env.NODE_ENV === 'production' || process.env.CLIENT_URL;
+                    // Re-read fresh user role (in case role changed)
+                    const freshUser = await usersCollection.findOne({ email: decoded.email });
+                    if (!freshUser) return res.status(403).send({ message: 'User not found' });
 
-                    res.cookie('accessToken', newAccessToken, {
-                        httpOnly: true,
-                        secure: isProd,
-                        sameSite: isProd ? 'none' : 'lax',
-                        maxAge: 15 * 60 * 1000,
-                    });
+                    const newAccessToken = generateAccessToken({ email: decoded.email, role: freshUser.role || 'user' });
+                    const newRefreshToken = generateRefreshToken({ email: decoded.email });
+
+                    // Persist rotated refresh token
+                    await usersCollection.updateOne({ email: decoded.email }, { $set: { refreshToken: newRefreshToken } });
+
+                    const baseOptions = buildCookieOptions(req);
+
+                    // Replace cookies (clear first then set)
+                    res.clearCookie('accessToken', baseOptions);
+                    res.clearCookie('refreshToken', baseOptions);
+
+                    res.cookie('accessToken', newAccessToken, { ...baseOptions, maxAge: 15 * 60 * 1000 });
+                    res.cookie('refreshToken', newRefreshToken, { ...baseOptions, maxAge: 7 * 24 * 60 * 60 * 1000 });
 
                     return res.json({ message: 'Access token refreshed' });
                 });
@@ -337,15 +339,10 @@ async function run() {
                     await usersCollection.updateOne({ refreshToken }, { $unset: { refreshToken: "" } });
                 }
 
-                const isProd = process.env.NODE_ENV === 'production';
-                const cookieOptions = {
-                    httpOnly: true,
-                    secure: isProd,
-                    sameSite: isProd ? 'none' : 'lax',
-                };
+                const baseOptions = buildCookieOptions(req);
 
-                res.clearCookie('accessToken', cookieOptions);
-                res.clearCookie('refreshToken', cookieOptions);
+                res.clearCookie('accessToken', baseOptions);
+                res.clearCookie('refreshToken', baseOptions);
 
                 return res.json({ message: 'Logged out' });
             } catch (err) {
@@ -354,7 +351,7 @@ async function run() {
             }
         });
 
-        // Get current user profile
+        // ================= USER PROFILE =================
         app.get('/users/me', verifyJWT, async (req, res) => {
             try {
                 const email = req.decoded_email;
@@ -379,186 +376,18 @@ async function run() {
             }
         });
 
-        // Example admin route
-        app.get('/admin/data', verifyJWT, verifyAdmin, async (req, res) => {
-            return res.json({ message: 'admin only data' });
-        });
-
-        // (Optional) legacy users creation route (kept for compatibility)
-        // (Optional) legacy users creation route (kept for compatibility)
-        app.post('/users', async (req, res) => {
-            const user = req.body;
-            user.role = 'user'; // Force user role to prevent privilege escalation
-            user.createdAt = new Date();
-
-            // Generate unique referral code for the new user
-            user.referralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-            user.referralRewards = []; // Init rewards array
-
-            const existing = await usersCollection.findOne({ email: user.email });
-            if (existing) return res.send({ message: 'user already exist' });
-
-            // Application of Referral Logic
-            if (user.referralCodeInput) {
-                const referrer = await usersCollection.findOne({ referralCode: user.referralCodeInput });
-                if (referrer) {
-                    user.referredBy = referrer.email;
-
-                    // Reward Referrer (10% OFF Coupon)
-                    const reward = {
-                        id: new ObjectId(),
-                        type: 'coupon',
-                        code: `REF-${Math.floor(1000 + Math.random() * 9000)}`,
-                        discount: 10,
-                        description: 'Referral Bonus: 10% OFF',
-                        createdAt: new Date(),
-                        isUsed: false
-                    };
-
-                    await usersCollection.updateOne(
-                        { email: referrer.email },
-                        { $push: { referralRewards: reward } }
-                    );
-                }
-            }
-
-            // Remove the input field from the saved object
-            delete user.referralCodeInput;
-
-            const result = await usersCollection.insertOne(user);
-            res.json(result);
-        });
-
-        //  services related apis
-
-        // get all the services
-        app.get('/services', async (req, res) => {
-            try {
-                const { search, sort, category } = req.query;
-                const page = parseInt(req.query.page) || 0;
-                const limit = parseInt(req.query.limit) || 12; // default 12 as requested
-                const skip = page * limit;
-
-                let query = {};
-
-                // Search by title
-                if (search) {
-                    query.title = { $regex: search, $options: 'i' };
-                }
-
-                // Filter by category
-                if (category && category !== 'all') {
-                    query.category = category;
-                }
-
-                // Price Range Filter
-                const { min, max } = req.query;
-                if (min || max) {
-                    query.price = {};
-                    if (min) query.price.$gte = parseFloat(min);
-                    if (max) query.price.$lte = parseFloat(max);
-                }
-
-
-                // Get total count for pagination
-                const total = await servicesCollection.countDocuments(query);
-
-                let cursor = servicesCollection.find(query);
-
-                // Sorting
-                if (sort === 'price-asc') {
-                    cursor = cursor.sort({ price: 1 });
-                } else if (sort === 'price-desc') {
-                    cursor = cursor.sort({ price: -1 });
-                } else if (sort === 'newest') {
-                    cursor = cursor.sort({ createdAt: -1 });
-                }
-
-                const result = await cursor.skip(skip).limit(limit).toArray();
-
-                res.send({
-                    success: true,
-                    count: result.length,
-                    total,   // Total matching documents
-                    page,
-                    limit,
-                    data: result
-                });
-
-            } catch (error) {
-                res.status(500).send({ message: 'Server error', error });
-            }
-        });
-
-
-        // Get all unique categories with counts
-        app.get('/services/categories', async (req, res) => {
-            try {
-                const categories = await servicesCollection.aggregate([
-                    {
-                        $group: {
-                            _id: "$category",
-                            count: { $sum: 1 }
-                        }
-                    },
-                    {
-                        $project: {
-                            category: "$_id",
-                            count: 1,
-                            _id: 0
-                        }
-                    },
-                    {
-                        $sort: { category: 1 }
-                    }
-                ]).toArray();
-
-                res.send(categories);
-            } catch (error) {
-                res.status(500).send({ message: 'Server error', error });
-            }
-        });
-
-
-        //  Get Single service by id for details:
-        app.get('/services/:id', async (req, res) => {
-            try {
-                const id = req.params.id;
-
-                const service = await servicesCollection.findOne({
-                    _id: new ObjectId(id)
-                });
-
-                if (!service) {
-                    return res.status(404).json({ success: false, message: "Service not found" });
-                }
-
-                res.status(200).json({
-                    success: true,
-                    data: service
-                });
-
-            } catch (error) {
-                res.status(500).json({ success: false, message: "Server error" });
-            }
-        });
-        // ---------------------------------------------------------
-        // USERS MANAGEMENT (Admin)
-        // ---------------------------------------------------------
-
-        // Get all users (Admin)
+        // ================= ADMIN / USERS =================
         app.get('/users', verifyJWT, verifyAdmin, async (req, res) => {
             const result = await usersCollection.find().toArray();
             res.send(result);
         });
 
-        // Get decorators (Public or Admin)
         app.get('/decorators', async (req, res) => {
             const result = await usersCollection.find({ role: 'decorator' }).toArray();
             res.send(result);
         });
 
-        // Update user role and status (Admin)
+        // Update user role and status (Admin). Invalidate refresh token on role change.
         app.patch('/users/role/:id', verifyJWT, verifyAdmin, async (req, res) => {
             const id = req.params.id;
             const { role, status } = req.body;
@@ -568,29 +397,41 @@ async function run() {
             if (role) updateFields.role = role;
             if (status) updateFields.status = status;
 
-            const updateDoc = {
-                $set: updateFields
-            };
+            const updateDoc = { $set: updateFields };
             const result = await usersCollection.updateOne(filter, updateDoc);
+
+            // If role changed, unset refreshToken to force re-login
+            if (result.modifiedCount > 0 && role) {
+                await usersCollection.updateOne(filter, { $unset: { refreshToken: "" } });
+                console.log(`User role updated and refreshToken invalidated for user id: ${id}`);
+            }
+
             res.send(result);
         });
 
-        // ---------------------------------------------------------
-        // APPLICATIONS (Become Decorator)
-        // ---------------------------------------------------------
+        // Delete user (Admin only)
+        app.delete('/users/:id', verifyJWT, verifyAdmin, async (req, res) => {
+            try {
+                const id = req.params.id;
+                const query = { _id: new ObjectId(id) };
+                const result = await usersCollection.deleteOne(query);
 
+                if (result.deletedCount === 0) {
+                    return res.status(404).send({ message: 'User not found' });
+                }
+
+                return res.json({ success: true, message: 'User deleted successfully' });
+            } catch (err) {
+                console.error('delete user error:', err);
+                return res.status(500).send({ message: 'Server error' });
+            }
+        });
+
+        // ================= APPLICATIONS =================
         app.post('/applications', verifyJWT, async (req, res) => {
             const application = req.body;
-
-            // Check if already applied
             const existingApplication = await usersCollection.findOne({ email: application.email, status: 'requested' });
-            if (existingApplication) {
-                return res.send({ message: 'Already applied' });
-            }
-
-            // Ideally we might want a separate applicationsCollection, but for simplicity given the request,
-            // we will just update the user's status to 'requested' and maybe store extra details if needed.
-            // But 'ManageDecorators' looks at 'users'. So let's update 'users' collection directly.
+            if (existingApplication) return res.send({ message: 'Already applied' });
 
             const filter = { email: application.email };
             const updateDoc = {
@@ -602,23 +443,17 @@ async function run() {
                     description: application.description
                 }
             };
-
             const result = await usersCollection.updateOne(filter, updateDoc);
             res.send(result);
         });
 
-        // ---------------------------------------------------------
-        // SERVICES MANAGEMENT (Admin)
-        // ---------------------------------------------------------
-
-        // Add a service
+        // ================= SERVICES =================
         app.post('/services', verifyJWT, verifyAdmin, async (req, res) => {
             const service = req.body;
             const result = await servicesCollection.insertOne(service);
             res.send(result);
         });
 
-        // Delete a service
         app.delete('/services/:id', verifyJWT, verifyAdmin, async (req, res) => {
             const id = req.params.id;
             const query = { _id: new ObjectId(id) };
@@ -626,25 +461,16 @@ async function run() {
             res.send(result);
         });
 
-        // Update a service
         app.patch('/services/:id', verifyJWT, verifyAdmin, async (req, res) => {
             const id = req.params.id;
             const filter = { _id: new ObjectId(id) };
             const updatedService = req.body;
-            const updateDoc = {
-                $set: {
-                    ...updatedService
-                }
-            };
+            const updateDoc = { $set: { ...updatedService } };
             const result = await servicesCollection.updateOne(filter, updateDoc);
             res.send(result);
         });
 
-        // ---------------------------------------------------------
-        // BOOKINGS
-        // ---------------------------------------------------------
-
-        // Create booking (User)
+        // ================= BOOKINGS =================
         app.post('/bookings', verifyJWT, async (req, res) => {
             const booking = req.body;
             booking.createdAt = new Date();
@@ -653,7 +479,6 @@ async function run() {
             res.send(result);
         });
 
-        // Get bookings (Admin: all, User: mine, Decorator: assigned)
         app.get('/bookings', verifyJWT, async (req, res) => {
             const role = req.decoded_role;
             const email = req.decoded_email;
@@ -662,21 +487,13 @@ async function run() {
             const skip = page * limit;
 
             let query = {};
-            if (role === 'user') {
-                query = { userEmail: email };
-            } else if (role === 'decorator') {
-                query = { decoratorEmail: email };
-            }
+            if (role === 'user') query = { userEmail: email };
+            else if (role === 'decorator') query = { decoratorEmail: email };
 
             console.log(`API: Get Bookings - Role: ${role}, Email: ${email}`);
 
-            let result = await bookingsCollection.find(query)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .toArray();
+            let result = await bookingsCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray();
 
-            // Calculate Unread Messages for each booking
             if (role === 'user' || role === 'decorator') {
                 for (const booking of result) {
                     const unreadCount = await messagesCollection.countDocuments({
@@ -690,22 +507,15 @@ async function run() {
 
             const total = await bookingsCollection.countDocuments(query);
 
-            res.send({
-                data: result,
-                total,
-                limit,
-                page
-            });
+            res.send({ data: result, total, limit, page });
         });
 
-        // Cancel Booking (User - only 'pending')
         app.delete('/bookings/:id', verifyJWT, async (req, res) => {
             const id = req.params.id;
             const email = req.decoded_email;
             const role = req.decoded_role;
 
             const query = { _id: new ObjectId(id) };
-
             if (role === 'user') {
                 query.userEmail = email;
                 query.status = 'pending';
@@ -715,15 +525,12 @@ async function run() {
             res.send(result);
         });
 
-        // Update booking status/assign decorator (Admin/Decorator)
         app.patch('/bookings/:id', verifyJWT, async (req, res) => {
             const id = req.params.id;
             const { status, decoratorEmail } = req.body;
             const filter = { _id: new ObjectId(id) };
 
-            let updateDoc = {
-                $set: {}
-            };
+            let updateDoc = { $set: {} };
             if (status) updateDoc.$set.status = status;
             if (decoratorEmail) updateDoc.$set.decoratorEmail = decoratorEmail;
 
@@ -731,7 +538,6 @@ async function run() {
             res.send(result);
         });
 
-        // Get Single Booking
         app.get('/bookings/:id', verifyJWT, async (req, res) => {
             const id = req.params.id;
             console.log("API: Fetching booking ID:", id);
@@ -741,77 +547,56 @@ async function run() {
             res.send(result);
         });
 
-        // ---------------------------------------------------------
-        // PAYMENTS
-        // ---------------------------------------------------------
-
-        // Create Payment Intent
-        // Create Payment Intent
+        // ================= PAYMENTS =================
         app.post('/create-payment-intent', verifyJWT, async (req, res) => {
             try {
                 const { price } = req.body;
-                if (!price || isNaN(price)) {
-                    return res.status(400).send({ message: 'Invalid price' });
-                }
+                if (!price || isNaN(price)) return res.status(400).send({ message: 'Invalid price' });
                 const amount = Math.round(Number(price) * 100);
 
                 const paymentIntent = await stripe.paymentIntents.create({
-                    amount: amount,
+                    amount,
                     currency: 'usd',
-                    automatic_payment_methods: {
-                        enabled: true,
-                    },
+                    automatic_payment_methods: { enabled: true },
                 });
 
-                res.send({
-                    clientSecret: paymentIntent.client_secret
-                });
+                res.send({ clientSecret: paymentIntent.client_secret });
             } catch (error) {
                 console.error("Error creating payment intent:", error);
                 res.status(500).send({ message: error.message });
             }
         });
 
-
         app.post('/payment-checkout-session', async (req, res) => {
             const paymentInfo = req.body;
-
-            // Use parseFloat to handle number/numeric string, and Math.round for cents conversion
             const costInDollars = parseFloat(paymentInfo.cost);
-
-            if (isNaN(costInDollars) || costInDollars <= 0) {
-                return res.status(400).send({ message: 'Invalid or missing cost parameter.' });
-            }
+            if (isNaN(costInDollars) || costInDollars <= 0) return res.status(400).send({ message: 'Invalid or missing cost parameter.' });
 
             const amount = Math.round(costInDollars * 100);
 
             const session = await stripe.checkout.sessions.create({
-                line_items: [
-                    {
-                        price_data: {
-                            currency: 'usd',
-                            unit_amount: amount,
-                            product_data: {
-                                name: `Paying for: ${paymentInfo.parcelName}`,
-                            }
-                        },
-                        quantity: 1,
+                line_items: [{
+                    price_data: {
+                        currency: 'usd',
+                        unit_amount: amount,
+                        product_data: { name: `Paying for: ${paymentInfo.parcelName}` }
                     },
-                ],
+                    quantity: 1,
+                }],
                 customer_email: paymentInfo.senderEmail,
                 mode: 'payment',
                 metadata: {
-                    bookingId: paymentInfo.bookingId, // Changed from parcelId
+                    bookingId: paymentInfo.bookingId,
                     parcelId: paymentInfo.parcelId,
                     parcelName: paymentInfo.parcelName
                 },
                 success_url: `${process.env.CLIENT_URL}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
                 cancel_url: `${process.env.CLIENT_URL}/dashboard/payment-canceled`,
-            })
-            res.send({ url: session.url })
-        })
+            });
 
-        // Payment Success to save into database
+            res.send({ url: session.url });
+        });
+
         app.patch('/payment-success', async (req, res) => {
             const { session_id } = req.query;
             try {
@@ -823,87 +608,54 @@ async function run() {
                         email: session.customer_email,
                         amount: session.amount_total / 100,
                         date: new Date(),
-                        bookingId: session.metadata.bookingId, // Capture bookingId
+                        bookingId: session.metadata.bookingId,
                         parcelId: session.metadata.parcelId,
                         status: 'paid',
                         parcelName: session.metadata.parcelName
-                    }
+                    };
 
                     const result = await paymentsCollection.insertOne(payment);
 
-                    // Update Booking Status to 'paid'
                     const bookingId = session.metadata.bookingId;
                     if (bookingId) {
                         const filter = { _id: new ObjectId(bookingId) };
-                        const updateDoc = {
-                            $set: {
-                                status: 'paid'
-                            }
-                        };
+                        const updateDoc = { $set: { status: 'paid' } };
                         await bookingsCollection.updateOne(filter, updateDoc);
                     }
 
-                    res.send({
-                        success: true,
-                        transactionId: payment.transactionId,
-                        trackingId: result.insertedId
-                    });
+                    res.send({ success: true, transactionId: payment.transactionId, trackingId: result.insertedId });
                 } else {
                     res.status(400).send({ message: 'Payment not paid' });
                 }
-
             } catch (error) {
                 console.error("Error verifying payment:", error);
                 res.status(500).send({ message: error.message });
             }
         });
 
-
-        // Save Payment Info
         app.post('/payments', verifyJWT, async (req, res) => {
             const payment = req.body;
             const paymentResult = await paymentsCollection.insertOne(payment);
-
-            // carefully delete each item from the cart
-            const query = {
-                _id: {
-                    $in: payment.bookingIds.map(id => new ObjectId(id))
-                }
-            };
-
-            const updatedDoc = {
-                $set: {
-                    status: 'paid'
-                }
-            }
-
+            const query = { _id: { $in: payment.bookingIds.map(id => new ObjectId(id)) } };
+            const updatedDoc = { $set: { status: 'paid' } };
             const updatedResult = await bookingsCollection.updateMany(query, updatedDoc);
-
             res.send({ paymentResult, updatedResult });
         });
 
-        // Get Payment History
         app.get('/payments/:email', verifyJWT, async (req, res) => {
             const query = { email: req.params.email };
             const result = await paymentsCollection.find(query).toArray();
             res.send(result);
         });
 
-        // ---------------------------------------------------------
-        // DECORATOR FEATURES
-        // ---------------------------------------------------------
-
-        // Submit Application
+        // ================= DECORATOR FEATURES =================
         app.post('/applications', async (req, res) => {
             try {
                 const application = req.body;
                 application.createdAt = new Date();
                 application.status = 'pending';
-                // Check if already applied
                 const existing = await applicationsCollection.findOne({ email: application.email });
-                if (existing) {
-                    return res.send({ message: 'Already applied', insertedId: null });
-                }
+                if (existing) return res.send({ message: 'Already applied', insertedId: null });
                 const result = await applicationsCollection.insertOne(application);
                 res.send(result);
             } catch (error) {
@@ -912,85 +664,42 @@ async function run() {
             }
         });
 
-        // Get Decorator Stats
         app.get('/decorator/stats', verifyJWT, async (req, res) => {
             const email = req.decoded_email;
             const role = req.decoded_role;
-
-            if (role !== 'decorator') {
-                return res.status(403).send({ message: 'Forbidden access' });
-            }
+            if (role !== 'decorator') return res.status(403).send({ message: 'Forbidden access' });
 
             try {
-                // Aggregate bookings for this decorator
-                // We only count 'paid' or 'competed' bookings for earnings typically,
-                // but let's assume 'paid' is the trigger for now.
-                // Assuming services have a fixed price in the booking or we fetch from service?
-                // The booking schema should have 'price'.
-                // If not, we might need to lookup. But let's assume booking has it or we just count count for now.
-
-                // Let's check how bookings are stored. In /bookings POST, allow user to send price? 
-                // Or we rely on the service details. 
-                // For simplified 'earnings', let's sum 'price' of bookings where status='paid' or 'completed'.
-
                 const stats = await bookingsCollection.aggregate([
-                    {
-                        $match: {
-                            decoratorEmail: email,
-                            status: { $in: ['paid', 'completed', 'in-progress'] } // active/paid bookings
-                        }
-                    },
+                    { $match: { decoratorEmail: email, status: { $in: ['paid', 'completed', 'in-progress'] } } },
                     {
                         $group: {
                             _id: null,
                             totalBookings: { $sum: 1 },
-                            totalEarnings: { $sum: { $toDouble: "$price" } }, // Ensure price is number
-                            completedBookings: {
-                                $sum: {
-                                    $cond: [{ $eq: ["$status", "completed"] }, 1, 0]
-                                }
-                            }
+                            totalEarnings: { $sum: { $toDouble: "$price" } },
+                            completedBookings: { $sum: { $cond: [{ $eq: ["$status", "completed"] }, 1, 0] } }
                         }
                     }
                 ]).toArray();
 
                 const data = stats.length > 0 ? stats[0] : { totalBookings: 0, totalEarnings: 0, completedBookings: 0 };
-
                 res.send(data);
-
             } catch (error) {
                 console.error("Error getting decorator stats:", error);
                 res.status(500).send({ message: 'Server error' });
             }
         });
 
-        // ---------------------------------------------------------
-        // ANALYTICS (Admin)
-        // ---------------------------------------------------------
+        // ================= ANALYTICS =================
         app.get('/admin/stats', verifyJWT, verifyAdmin, async (req, res) => {
             const users = await usersCollection.estimatedDocumentCount();
             const products = await servicesCollection.estimatedDocumentCount();
             const bookings = await bookingsCollection.estimatedDocumentCount();
 
-            // simple revenue aggregation
-            // assuming bookings have a 'price' field
-            const payments = await bookingsCollection.aggregate([
-                {
-                    $group: {
-                        _id: null,
-                        totalRevenue: { $sum: '$price' }
-                    }
-                }
-            ]).toArray();
-
+            const payments = await bookingsCollection.aggregate([{ $group: { _id: null, totalRevenue: { $sum: '$price' } } }]).toArray();
             const revenue = payments.length > 0 ? payments[0].totalRevenue : 0;
 
-            res.send({
-                users,
-                products,
-                bookings,
-                revenue
-            });
+            res.send({ users, products, bookings, revenue });
         });
 
         app.listen(port, () => console.log(`Server running on port ${port}`));
