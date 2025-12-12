@@ -388,7 +388,7 @@ async function run() {
         // (Optional) legacy users creation route (kept for compatibility)
         app.post('/users', async (req, res) => {
             const user = req.body;
-            user.role = user.role || 'user';
+            user.role = 'user'; // Force user role to prevent privilege escalation
             user.createdAt = new Date();
 
             // Generate unique referral code for the new user
