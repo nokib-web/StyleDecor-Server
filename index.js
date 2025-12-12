@@ -3,7 +3,8 @@ const cors = require('cors');
 require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const admin = require("firebase-admin");
-const serviceAccount = require("./styledecor-Admin-SDK.json");
+// const serviceAccount = require("./styledecor-Admin-SDK.json"); // Removed direct require for safety fallback
+
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET;
@@ -15,10 +16,30 @@ const app = express();
 // const cors = require('cors');
 const port = process.env.PORT || 5000;
 
+
 // Initialize Firebase Admin
-admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-});
+let serviceAccount;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    } catch (e) {
+        console.error("Failed to parse FIREBASE_SERVICE_ACCOUNT", e);
+    }
+} else {
+    try {
+        serviceAccount = require("./styledecor-Admin-SDK.json");
+    } catch (e) {
+        console.warn("Local Firebase SDK file not found.");
+    }
+}
+
+if (serviceAccount) {
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+    });
+} else {
+    console.error("Firebase Admin SDK not initialized. Missing credentials.");
+}
 
 
 const allowedOrigins = [
