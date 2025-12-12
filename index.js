@@ -282,7 +282,7 @@ async function run() {
                 // store refresh token in DB (for revocation)
                 await usersCollection.updateOne({ email }, { $set: { refreshToken } });
 
-                const isProd = process.env.NODE_ENV === 'production';
+                const isProd = process.env.NODE_ENV === 'production' || process.env.CLIENT_URL;
                 const cookieOptions = {
                     httpOnly: true,
                     secure: isProd,
@@ -312,7 +312,7 @@ async function run() {
                     if (err) return res.status(403).send({ message: 'Invalid refresh token' });
 
                     const newAccessToken = generateAccessToken({ email: decoded.email, role: user.role });
-                    const isProd = process.env.NODE_ENV === 'production';
+                    const isProd = process.env.NODE_ENV === 'production' || process.env.CLIENT_URL;
 
                     res.cookie('accessToken', newAccessToken, {
                         httpOnly: true,
