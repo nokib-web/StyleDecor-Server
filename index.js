@@ -3,7 +3,6 @@ const cors = require('cors');
 require('dotenv').config();
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const admin = require("firebase-admin");
-// const serviceAccount = require("./styledecor-Admin-SDK.json"); // Removed direct require for safety fallback
 
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
@@ -135,7 +134,7 @@ async function run() {
         // ===========================================
         // WISHLIST ENDPOINTS
         // ===========================================
-        // ... (existing wishlist code) ...
+      
         // Add to Wishlist
         app.post('/wishlist', verifyJWT, async (req, res) => {
             const item = req.body;
@@ -186,7 +185,7 @@ async function run() {
         // ===========================================
         // CHAT / MESSAGING ENDPOINTS
         // ===========================================
-        // Send a Message
+  
         // Send a Message
         app.post('/messages', verifyJWT, async (req, res) => {
             const message = req.body;
@@ -254,7 +253,7 @@ async function run() {
 
 
         // Firebase login: client posts idToken; server verifies
-        // RESPONSE: Returns accessToken and refreshToken in JSON (No Cookies)
+        // RESPONSE: Returns accessToken and refreshToken in JSON 
         app.post('/auth/firebase-login', async (req, res) => {
             try {
                 const { idToken } = req.body;
@@ -330,10 +329,6 @@ async function run() {
         // Logout
         app.post('/auth/logout', async (req, res) => {
             try {
-                // Ideally client sends ID, but we can't easily get it if not authenticated.
-                // Or client just clears local storage.
-                // We can optionally invalidate if client sends it.
-                // For now, simpler: Just success. Client clears token.
                 return res.json({ message: 'Logged out' });
             } catch (err) {
                 console.error('logout error:', err);
@@ -348,7 +343,7 @@ async function run() {
                 let user = await usersCollection.findOne({ email }, { projection: { refreshToken: 0 } });
                 if (!user) return res.status(404).send({ message: 'User not found' });
 
-                // Backward compatibility: Generate referral code if missing
+                
                 if (!user.referralCode) {
                     const newCode = Math.random().toString(36).substring(2, 8).toUpperCase();
                     await usersCollection.updateOne(
@@ -371,16 +366,16 @@ async function run() {
             return res.json({ message: 'admin only data' });
         });
 
-        // (Optional) legacy users creation route (kept for compatibility)
+  
         // (Optional) legacy users creation route (kept for compatibility)
         app.post('/users', async (req, res) => {
             const user = req.body;
-            user.role = 'user'; // Force user role to prevent privilege escalation
+            user.role = 'user'; 
             user.createdAt = new Date();
 
             // Generate unique referral code for the new user
             user.referralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-            user.referralRewards = []; // Init rewards array
+            user.referralRewards = []; 
 
             const existing = await usersCollection.findOne({ email: user.email });
             if (existing) return res.send({ message: 'user already exist' });
@@ -529,6 +524,7 @@ async function run() {
                 res.status(500).json({ success: false, message: "Server error" });
             }
         });
+
         // ---------------------------------------------------------
         // USERS MANAGEMENT (Admin)
         // ---------------------------------------------------------
@@ -583,10 +579,7 @@ async function run() {
                 return res.send({ message: 'Already applied' });
             }
 
-            // Ideally we might want a separate applicationsCollection, but for simplicity given the request,
-            // we will just update the user's status to 'requested' and maybe store extra details if needed.
-            // But 'ManageDecorators' looks at 'users'. So let's update 'users' collection directly.
-
+          
             const filter = { email: application.email };
             const updateDoc = {
                 $set: {
@@ -740,7 +733,7 @@ async function run() {
         // PAYMENTS
         // ---------------------------------------------------------
 
-        // Create Payment Intent
+
         // Create Payment Intent
         app.post('/create-payment-intent', verifyJWT, async (req, res) => {
             try {
@@ -917,16 +910,6 @@ async function run() {
             }
 
             try {
-                // Aggregate bookings for this decorator
-                // We only count 'paid' or 'competed' bookings for earnings typically,
-                // but let's assume 'paid' is the trigger for now.
-                // Assuming services have a fixed price in the booking or we fetch from service?
-                // The booking schema should have 'price'.
-                // If not, we might need to lookup. But let's assume booking has it or we just count count for now.
-
-                // Let's check how bookings are stored. In /bookings POST, allow user to send price? 
-                // Or we rely on the service details. 
-                // For simplified 'earnings', let's sum 'price' of bookings where status='paid' or 'completed'.
 
                 const stats = await bookingsCollection.aggregate([
                     {
