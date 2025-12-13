@@ -7,8 +7,6 @@ const admin = require("firebase-admin");
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const stripeKey = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET;
-if (!stripeKey) console.error("FATAL: STRIPE_SECRET_KEY is missing!");
-else console.log("Stripe Key Loaded: " + stripeKey + "...");
 const stripe = require('stripe')(stripeKey);
 
 const app = express();
